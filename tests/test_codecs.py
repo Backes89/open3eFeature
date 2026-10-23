@@ -140,4 +140,36 @@ def test_datapoints_length():
         codec_len = len(codec)
         subcodec_len_sum = _calc_codec_length(codec)
 
-        assert codec_len == subcodec_len_sum, f"Did {did}: Length {codec_len} does not match sum of subType lenghts {subcodec_len_sum}" 
+        assert codec_len == subcodec_len_sum, f"Did {did}: Length {codec_len} does not match sum of subType lenghts {subcodec_len_sum}"
+
+def test_zigbee_device_setpoint_switch():
+    setpoint_dids = [did for did, codec in dataIdentifiers["dids"].items()
+                     if codec.id.startswith("ZigBee") and codec.id.endswith("DeviceSetpoint")]
+    assert len(setpoint_dids) == 40
+
+    # real captures from a single room control installation
+    distributor = bytes.fromhex("00032602000000000000000000")
+    trv_display_turned = bytes.fromhex("00020000000000000000000001")
+    climate_sensor = bytes.fromhex("00010000000000000000000000")
+
+    for did in setpoint_dids:
+        codec = dataIdentifiers["dids"][did]
+
+        decoded = codec.decode(distributor)
+        assert decoded["ViCareDevice"]["ID"] == 3
+        assert decoded["ViCareDevice"]["MaximumFlowTemperature"] == 55.0
+
+        decoded = codec.decode(trv_display_turned)
+        assert decoded["ViCareDevice"]["ID"] == 2
+        assert decoded["ViCareDevice"]["DeviceDisplayTurned"]["Text"] == "Turned"
+
+        decoded = codec.decode(climate_sensor)
+        assert decoded["ViCareDevice"]["ID"] == 1
+        assert decoded["ViCareDevice"]["Unknown_02_12"] == "0000000000000000000000"
+
+        for raw_input in (distributor, trv_display_turned, climate_sensor):
+            assert codec.encode(codec.decode(raw_input)) == raw_input, f"Did {did}: roundtrip failed for {raw_input.hex()}"
+
+        decoded = codec.decode(distributor)
+        decoded["ViCareDevice"]["MaximumFlowTemperature"] = 45.0
+        assert codec.encode(decoded) == bytes.fromhex("0003c201000000000000000000")
