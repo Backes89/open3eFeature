@@ -127,6 +127,8 @@ Since V0.5.0 all data point codecs definitions are checked for correct length va
 **IMPORTANT: When addressing sub-items of data points, ALWAYS use `ecu.did.sub` format (including ecu!)**
 otherwise intended `did.sub` will get interpreted as `ecu.did` and cause unintended access or failure!
 
+Nested sub-items can be addressed by a path of names, following the keys of the decoded value (the MQTT topic levels), e.g. `0x6c3.2086.ViCareDevice.ActualTemperature`. Below the first level only names are accepted, no index. Writing replaces only the bytes of the addressed field. The ID of an `O3ESwitch` (e.g. the device type) can not be changed by writing, also not when writing the whole data point. ID and Text of a switch or enum can be read by path (not in raw mode), but not written. Paths into lists (`O3EList`, `O3EArray`) are not supported.
+
 **For details regarding the different ways of addressing data points (complex, named) [refer to the Wiki](https://github.com/open3e/open3e/wiki/032-Command-Line-Arguments#komplexe-adressierung)**
 
 **Remark: Do not start more than one instance of open3e!** Doing so, could lead to conflicts on CAN bus causing open3e to stop with errors.

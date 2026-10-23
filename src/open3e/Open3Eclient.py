@@ -65,6 +65,7 @@ def main():
     # complex addressing: 0x680.[257,258,259] or 0x680.256 or 257,259,261 or 256 ...
     # also possibel 0x680.[257.0,258.1,259]  or 0x680.256.1 ...
     # also Vcal.BusIdentification.BusAddress or Vcal.256.BusAddress ...
+    # also nested subs: 0x6c3.2086.ViCareDevice.ActualTemperature (names as in decoded value / MQTT topic)
     # if sub gets addressed, ecu must be given, otherwiese not clear if ecu.did or did.sub
     def eval_complex(v) -> list: 
         """ 
@@ -97,8 +98,8 @@ def main():
             # only ecu.did
             return [[ecu,parts[1],None]]
             
-        # ecu.did.sub
-        return [[ecu,parts[1],parts[2]]]
+        # ecu.did.sub or ecu.did.sub.sub... (nested sub path, resolved in class)
+        return [[ecu,parts[1],'.'.join(parts[2:])]]
 
 
     def eval_complex_list(v) -> list:  
@@ -128,12 +129,12 @@ def main():
     # gets did and sub from fraction tailing 'ecu.'
     def get_didsub(v) -> tuple: # [did,sub=none]
         """
-        :param v: something representing did or did.sub
-        :return: tuple of did,sub where sub=None if not given 
+        :param v: something representing did or did.sub (sub may be a nested path sub.sub...)
+        :return: tuple of did,sub where sub=None if not given
         """
         parts = str(v).replace(' ','').split('.')
         if (len(parts) > 1):
-            return [parts[0],parts[1]]
+            return [parts[0],'.'.join(parts[1:])]
         return [v,None]
           
 

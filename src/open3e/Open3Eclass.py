@@ -180,6 +180,152 @@ class O3Eclass():
                     return sub
             raise ValueError(f"No Sub found according to {v} with DID {did}")
 
+    # nested sub addressing ------
+    # A sub path follows the keys of the decoded value, i.e. the MQTT topic levels, e.g.
+    # 0x6c3.2086.ViCareDevice.ActualTemperature. The first level is resolved by
+    # get_sub_as_int as before (index or name). Below it only names are accepted, no index
+    # and no eval: below an O3ESwitch the same index would point to a different field
+    # depending on the device type. O3ESwitch cases are transparent (no 'Data' level) and
+    # the case is selected by the discriminator byte of the data just read.
+
+    def split_sub(self, sub) -> list:
+        """ 'ViCareDevice.ActualTemperature' -> ['ViCareDevice', 'ActualTemperature'], 1 or 'Name' -> [sub] """
+        if(isinstance(sub, str) and '.' in sub):
+            return sub.split('.')
+        return [sub]
+
+    def check_pure(self, did:int, data):
+        # positions below an O3ESwitch depend on the data, so it has to be complete
+        if(not isinstance(data, (bytes, bytearray))):
+            raise ValueError(f"Reading DID {did} failed: {data}")
+        if(len(data) < self.dataIdentifiers[did].string_len):
+            raise ValueError(f"DID {did}: received {len(data)} bytes, expected {self.dataIdentifiers[did].string_len}")
+
+    def resolve_sub_path(self, did:int, codec, start:int, path:list, data:bytes):
+        """
+        Follows the sub path below codec, which starts at byte position start of data.
+        Returns codec, start, stop, names, keys
+            names: ids of the codecs passed, starting with codec
+            keys:  pseudo keys behind the last codec, e.g. ID/Text of an O3ESwitch or O3EEnum (read only)
+        """
+        cdcs = open3e.Open3Ecodecs
+        names = [codec.id]
+        keys = []
+        for elem in path:
+            elem = str(elem)
+            if(elem == ''):
+                raise ValueError(f"Empty element in sub path with DID {did}")
+            if(isinstance(codec, (cdcs.O3EList, cdcs.O3EArray))):
+                raise TypeError(f"Sub path into {type(codec).__name__} {codec.id} is not supported with DID {did}")
+            if(keys or not isinstance(codec, (cdcs.O3EComplexType, cdcs.O3ESwitch))):
+                keys.append(elem)  # pseudo key of a leaf codec, e.g. Text of an O3EEnum
+                continue
+            caseinfo = ""
+            if(isinstance(codec, cdcs.O3ESwitch)):
+                if(elem.lower() in ['id', 'text']):
+                    keys.append('ID' if elem.lower() == 'id' else 'Text')  # discriminator, defines the structure
+                    continue
+                val = data[start]
+                case = codec.cases.get(val, codec.default)
+                if(case is None):
+                    raise ValueError(f"{codec.id}: no matching case for ID {val} with DID {did}")
+                children = case.subTypes if isinstance(case, cdcs.O3EComplexType) else [case]
+                start += 1  # discriminator byte
+                caseinfo = f" with ID {val}"
+            else:
+                children = codec.subTypes
+            isel = None
+            for i in range(len(children)):
+                if(children[i].id.lower() == elem.lower()):
+                    isel = i
+                    break
+            if(isel is None):
+                if(elem.isdigit()):
+                    raise ValueError(f"Index {elem} is not supported in {codec.id} with DID {did}, use the name (only names below the first sub level and in an O3ESwitch)")
+                raise ValueError(f"No Sub found according to {elem} in {codec.id}{caseinfo} with DID {did}")
+            for i in range(isel):
+                start += children[i].string_len
+            codec = children[isel]
+            names.append(codec.id)
+        return codec, start, start + codec.string_len, names, keys
+
+    def locate_sub(self, did:int, sub, data):
+        """
+        Locates sub (index, name or path) within DID did, data as read from the device.
+        Returns codec, start, stop, idstr, keys
+            idstr: ids of the codecs along the path joined by '/' (MQTT topic), without the pseudo keys
+        """
+        cdcs = open3e.Open3Ecodecs
+        selectedDid = self.dataIdentifiers[did]
+        path = self.split_sub(sub)
+
+        if(isinstance(selectedDid, cdcs.O3ESwitch)):
+            # top-level switch: even the first level depends on the device type, so names only
+            self.check_pure(did, data)
+            codec, start, stop, names, keys = self.resolve_sub_path(did, selectedDid, 0, path, data)
+            return codec, start, stop, '/'.join(names[1:]), keys
+
+        if(not isinstance(selectedDid, cdcs.O3EComplexType)):
+            raise TypeError(f"DID {did} is not complex")
+
+        isub = self.get_sub_as_int(did, path[0])
+        if (isub >= len(selectedDid.subTypes) or isub < 0):
+            raise IndexError(f"Sub-Item with Index {isub} does not exist with DID {did}")
+
+        codec = selectedDid.subTypes[isub]
+        start = 0
+        for i in range(isub):
+            start += selectedDid.subTypes[i].string_len
+        if(len(path) == 1):
+            return codec, start, start + codec.string_len, codec.id, []
+
+        self.check_pure(did, data)
+        codec, start, stop, names, keys = self.resolve_sub_path(did, codec, start, path[1:], data)
+        return codec, start, stop, '/'.join(names), keys
+
+    def check_sub_first_level(self, did:int, sub, write:bool=False):
+        # same checks and messages as before nested sub addressing, done before anything is read from the bus
+        cdcs = open3e.Open3Ecodecs
+        selectedDid = self.dataIdentifiers[did]
+        if(isinstance(selectedDid, cdcs.O3ESwitch)):
+            return
+        if(not isinstance(selectedDid, cdcs.O3EComplexType)):
+            raise TypeError(f"DID {did} is not complex")
+        isub = self.get_sub_as_int(did, self.split_sub(sub)[0])
+        if (isub >= len(selectedDid.subTypes) or isub < 0):
+            if(write):
+                raise IndexError(f"Sub Index {isub} does not exist in DID {did}")
+            raise IndexError(f"Sub-Item with Index {isub} does not exist with DID {did}")
+
+    def pick_keys(self, did:int, value, keys:list):
+        # picks pseudo keys like ID/Text from a decoded value, returns the value and the keys as named in it
+        found = []
+        for key in keys:
+            match = [k for k in value if str(k).lower() == key.lower()] if isinstance(value, dict) else []
+            if(len(match) == 0):
+                raise ValueError(f"No Sub found according to {key} in decoded value with DID {did}")
+            value = value[match[0]]
+            found.append(str(match[0]))
+        return value, found
+
+    def switch_positions(self, codec, start:int=0) -> list:
+        # byte positions of O3ESwitch discriminators at fixed places of codec (not inside switch cases)
+        cdcs = open3e.Open3Ecodecs
+        if(isinstance(codec, cdcs.O3ESwitch)):
+            return [(start, codec)]
+        found = []
+        if(isinstance(codec, cdcs.O3EComplexType)):
+            for sub in codec.subTypes:
+                found += self.switch_positions(sub, start)
+                start += sub.string_len
+        return found
+
+    def check_switch_ids(self, did:int, new:bytes, old:bytes, positions:list):
+        # the device type of a slot is defined by the connected hardware, writing must not change it
+        for pos, codec in positions:
+            if(new[pos] != old[pos]):
+                raise ValueError(f"{codec.id}: ID {new[pos]} differs from ID {old[pos]} read from DID {did}, the ID can not be changed by writing")
+
 
     #++++++++++++++++++++++++++++++
     # 'global' methods
@@ -199,8 +345,11 @@ class O3Eclass():
             The Data Identifier (DID) to read. Can be provided as an integer or string (idstr, .id in codec).
         raw : bool
             If True, the method operates in raw mode, returning binary data without decoding.
-        sub : int or None, optional
-            The index of the sub-item within a complex DID structure. If None, the entire DID is read.
+        sub : int, str or None, optional
+            The index or name of the sub-item within a complex DID structure. If None, the entire DID is read.
+            For nested structures a path of names separated by dots, e.g. 'ViCareDevice.ActualTemperature'.
+            Below the first level only names are accepted. ID and Text of an O3ESwitch or O3EEnum can be read
+            this way (not in raw mode), but not written. Paths into O3EList/O3EArray are not supported.
 
         Returns:
         -------
@@ -209,7 +358,8 @@ class O3Eclass():
                 - decodedData : Any
                     The decoded value of the DID or subfield.
                 - idstr : str
-                    Identifier string for logging or error handling.
+                    Identifier string for logging or error handling. For a nested sub path the names
+                    joined by '/', e.g. 'ViCareDevice/ActualTemperature' (used for the MQTT topic).
                 - idid : int
                     The integer representation of the DID.
             - If an error occurs:
@@ -249,33 +399,27 @@ class O3Eclass():
 
             if(idid not in self.dataIdentifiers):
                 raise KeyError(f"No Codec specified for DID {idid}")
-            
-            selectedDid = self.dataIdentifiers[idid]
 
-            if(not isinstance(selectedDid, open3e.Open3Ecodecs.O3EComplexType)):
-                raise TypeError(f"DID {idid} is not complex")   
-            
-            isub = self.get_sub_as_int(idid, sub)
-
-            if (isub >= len(selectedDid.subTypes) or isub < 0):
-                raise IndexError(f"Sub-Item with Index {isub} does not exist with DID {idid}")
-                
-            selectedSub = selectedDid.subTypes[isub]
-
-            startIndexSub = 0
-            for i in range(isub):
-                startIndexSub += selectedDid.subTypes[i].string_len
-            stopIndexSub = startIndexSub + selectedSub.string_len
+            self.check_sub_first_level(idid, sub)
 
             # receive bin data directly, no codec, no conversion
             string_bin,_ = self.readPure(idid, binary=True)
+
+            # sub may be a path like ViCareDevice.ActualTemperature, see locate_sub()
+            selectedSub, startIndexSub, stopIndexSub, idstr, keys = self.locate_sub(idid, sub, string_bin)
+            if(keys and raw):
+                raise ValueError(f"{'/'.join([idstr] + keys) if idstr else '/'.join(keys)} is not available in raw mode with DID {idid}")
             string_bin_sub = string_bin[startIndexSub:stopIndexSub]
 
             with open3e.Open3Ecodecs.codec_lock:
                 open3e.Open3Ecodecs.flag_rawmode = raw
                 decodedData = selectedSub.decode(string_bin_sub)
 
-            return decodedData, selectedSub.id, idid
+            if(keys):
+                decodedData, found = self.pick_keys(idid, decodedData, keys)
+                idstr = '/'.join([idstr] + found) if idstr else '/'.join(found)
+
+            return decodedData, idstr, idid
         except NegativeResponseException as e:
             return f'Device rejected this read access. Probably DID {idid} is not available. {e}', f'ERR/{hex(self.tx)}.{idid}', idid
         except Exception as e:
@@ -303,43 +447,45 @@ class O3Eclass():
             if(idid not in self.dataIdentifiers):
                 raise KeyError(f"No Codec specified for DID {idid}")
             
+            readfrom = readecu if (readecu is not None) else self
+
             if(sub is None):
+                # an O3ESwitch ID is the type of the connected device, writing must not change it
+                positions = self.switch_positions(self.dataIdentifiers[idid])
+                if(positions):
+                    string_bin,_ = readfrom.readPure(idid, binary=True)
+                    self.check_pure(idid, string_bin)
+                    with open3e.Open3Ecodecs.codec_lock:
+                        open3e.Open3Ecodecs.flag_rawmode = raw
+                        new_bin = bytes(self.dataIdentifiers[idid].encode(val))
+                    self.check_switch_ids(idid, new_bin, string_bin, positions)
                 with open3e.Open3Ecodecs.codec_lock:
                     return self._writeByDid(idid, val, raw, useService77)
 
-            selectedDid = self.dataIdentifiers[idid]
-
-            if(not isinstance(selectedDid, open3e.Open3Ecodecs.O3EComplexType)):
-                raise TypeError(f"DID {idid} is not complex")   
-            
-            isub = self.get_sub_as_int(idid, sub)
-
-            if (isub >= len(selectedDid.subTypes) or isub < 0):
-                raise IndexError(f"Sub Index {isub} does not exist in DID {idid}")
-            
-            selectedSub = selectedDid.subTypes[isub]
-
-            startIndexSub = 0
-            for i in range(isub):
-                startIndexSub += selectedDid.subTypes[i].string_len
-            stopIndexSub = startIndexSub + selectedSub.string_len
+            self.check_sub_first_level(idid, sub, write=True)
 
             # receive bin data directly, no codec, no conversion
-            string_bin = None  # noetig?
-            if(readecu is not None):
-                string_bin,_ = readecu.readPure(idid, binary=True)
-            else:
-                string_bin,_ = self.readPure(idid, binary=True)
+            string_bin,_ = readfrom.readPure(idid, binary=True)
+
+            # sub may be a path like ViCareDevice.ActualTemperature, see locate_sub()
+            selectedSub, startIndexSub, stopIndexSub, idstr, keys = self.locate_sub(idid, sub, string_bin)
+            if(keys):
+                raise ValueError(f"{'/'.join([idstr] + keys) if idstr else '/'.join(keys)} can not be written by sub path with DID {idid}, write {selectedSub.id} as a whole")
+            positions = self.switch_positions(selectedSub, startIndexSub)
+            if(positions):
+                self.check_pure(idid, string_bin)
 
             with open3e.Open3Ecodecs.codec_lock:
                 # encode value to bytes
                 open3e.Open3Ecodecs.flag_rawmode = raw
                 string_bin_sub = bytes(selectedSub.encode(val))
-                if(len(string_bin_sub) != selectedSub.string_len):
-                    raise ValueError(f"Encoded value for sub {selectedSub.id} of DID {idid} has {len(string_bin_sub)} bytes, expected {selectedSub.string_len}")
+                if(len(string_bin_sub) != stopIndexSub - startIndexSub):
+                    raise ValueError(f"Encoded value for sub {selectedSub.id} of DID {idid} has {len(string_bin_sub)} bytes, expected {stopIndexSub - startIndexSub}")
 
                 # replace bytes in did data bytes
+                old_bin = string_bin
                 string_bin = string_bin[:startIndexSub] + string_bin_sub + string_bin[stopIndexSub:]
+                self.check_switch_ids(idid, string_bin, old_bin, positions)
 
                 # write back #TODO hier waere binaeres Schreiben wuenschenswert ohne Umweg ueber Codecs
                 open3e.Open3Ecodecs.flag_binary = True
